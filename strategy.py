@@ -15,80 +15,139 @@ STUDENT INSTRUCTIONS:
 class Strategy:
     def __init__(self):
         """
-        Initialize any state variables here.
-        This function is called exactly once at the very beginning of the backtest.
-        
-        GUIDANCE:
-        - You can create state variables using 'self.' to store data across steps.
-        - For example, you might want to store historical market data, indicators, 
-          or previous portfolio allocations.
-        - PERFORMANCE WARNING: Storing too much historical data in memory (e.g., 
-          growing a list infinitely) can significantly slow down the backtest or 
-          cause memory crashes. Always try to keep only the data you need. 
+        Initialize state for a simple intraday cross-sectional strategy.
+
+        IMPORTANT LIMITATION:
+        - The framework passes only `current_market_data` into `step()`.
+        - The timestamp is not available inside this class.
+        - We therefore approximate day boundaries with a fixed 78 bars/day
+          counter. This works for normal full trading days.
+        - On abnormal short days in the dataset, exact end-of-day flattening is
+          not possible from `strategy.py` alone.
         """
-        # EXAMPLE STATE VARIABLES (Modify or remove these for your strategy):
-        # We will use a list to store the historical price Series
-        self.price_history = []
-        self.lookback_period = 78
+        self.prev_close = None
+        self.close_history = []
+        self.held_weights = None
+        self.bars_left_in_hold = 0
+        self.bar_in_day = 0
+        self.bars_per_day = 78
+        self.top_k = 1
+        self.skip_open_bars = 0
+        self.lookback_bars = 1
+        self.hold_bars = 1
+        self.min_volume_rank = 0.0
+        self.mode = "reversal"
 
     def step(self, current_market_data: pd.DataFrame) -> pd.Series:
         """
-        Core strategy logic. 
-        This function is called at every timestamp by the BacktestEngine.
-        
-        INPUT:
-        current_market_data (pd.DataFrame): Market snapshot at the current timestamp.
-                                            Index = Tickers, Columns = fields
-                                            ('close', 'volume').
-                                    
-        OUTPUT:
-        pd.Series: Target weights for the portfolio.
-                   Index = Tickers, Values = Weights (0.0 to 1.0).
-                   The sum of weights must be <= 1.0.
-                   
-        GUIDANCE:
-        - The code below is just a reference/example implementation. 
-        - Please completely modify this function to reflect your own trading logic.
+        Trade a cross-sectional reversal or momentum signal.
+
+        - `reversal`: buy the `top_k` names with the worst last-bar returns.
+        - `momentum`: buy the `top_k` names with the best last-bar returns.
+        - `skip_open_bars`: hold cash for the first N assumed bars each day.
+        - `lookback_bars`: signal horizon used to rank assets.
+        - `hold_bars`: number of bars to keep a selected basket.
+        - `min_volume_rank`: optional same-bar liquidity filter in [0, 1].
+        - The final assumed bar of each normal day is held in cash.
         """
-        
-        # --- START OF EXAMPLE STRATEGY LOGIC ---
-        
+
         if "close" not in current_market_data.columns:
             raise ValueError("Input market data must contain a 'close' column.")
 
-        current_prices = current_market_data["close"]
+        current_close = current_market_data["close"]
+        weights = pd.Series(0.0, index=current_close.index)
 
-        # 1. Update internal state with the new data
-        self.price_history.append(current_prices)
-        
-        # Keep only the required lookback period to save memory (Best Practice!)
-        if len(self.price_history) > self.lookback_period:
-            self.price_history.pop(0)
-            
-        # 2. Strategy Logic
-        # If we don't have enough data yet, stay 100% in cash (return all zeros)
-        if len(self.price_history) < self.lookback_period:
-            return pd.Series(0.0, index=current_prices.index)
-            
-        # Convert our history list into a DataFrame to easily calculate the mean
-        history_df = pd.DataFrame(self.price_history)
-        moving_average = history_df.mean()
-        
-        # Identify assets where the current price is ABOVE its moving average (Trend Following)
-        bullish_assets = current_prices[current_prices > moving_average].index
-        
-        # 3. Portfolio Allocation
-        # Initialize all weights to 0.0
-        weights = pd.Series(0.0, index=current_prices.index)
-        
-        # Allocate equally among bullish assets
-        num_bullish = len(bullish_assets)
-        if num_bullish > 0:
-            weight_per_asset = 1.0 / num_bullish
-            weights[bullish_assets] = weight_per_asset
-            
-        # Return the weights. 
-        # The engine will verify that weights >= 0 and weights.sum() <= 1.0
+        self.bar_in_day += 1
+        if self.bar_in_day > self.bars_per_day:
+            self.bar_in_day = 1
+            self.prev_close = None
+            self.close_history = []
+            self.held_weights = None
+            self.bars_left_in_hold = 0
+
+        # Go flat on the final assumed bar of a normal trading day.
+        if self.bar_in_day == self.bars_per_day:
+            self.prev_close = current_close
+            self.close_history.append(current_close)
+            if len(self.close_history) > self.lookback_bars + 1:
+                self.close_history.pop(0)
+            self.held_weights = weights
+            self.bars_left_in_hold = 0
+            return weights
+
+        if self.prev_close is None:
+            self.prev_close = current_close
+            self.close_history = [current_close]
+            self.held_weights = weights
+            self.bars_left_in_hold = 0
+            return weights
+
+        if self.top_k <= 0:
+            self.prev_close = current_close
+            self.held_weights = weights
+            self.bars_left_in_hold = 0
+            return weights
+
+        if self.skip_open_bars < 0:
+            raise ValueError("skip_open_bars must be >= 0.")
+
+        if self.lookback_bars <= 0:
+            raise ValueError("lookback_bars must be >= 1.")
+
+        if self.hold_bars <= 0:
+            raise ValueError("hold_bars must be >= 1.")
+
+        if not 0.0 <= self.min_volume_rank <= 1.0:
+            raise ValueError("min_volume_rank must be between 0.0 and 1.0.")
+
+        self.close_history.append(current_close)
+        if len(self.close_history) > self.lookback_bars + 1:
+            self.close_history.pop(0)
+
+        # Bar 1 stores the opening reference price. Skipping N opening bars means
+        # we also stay in cash for bars 2 through N+1.
+        if self.bar_in_day <= self.skip_open_bars + 1:
+            self.prev_close = current_close
+            self.held_weights = weights
+            self.bars_left_in_hold = 0
+            return weights
+
+        if self.bars_left_in_hold > 0 and self.held_weights is not None:
+            self.bars_left_in_hold -= 1
+            self.prev_close = current_close
+            return self.held_weights.copy()
+
+        if len(self.close_history) < self.lookback_bars + 1:
+            self.prev_close = current_close
+            self.held_weights = weights
+            self.bars_left_in_hold = 0
+            return weights
+
+        signal_return = self.close_history[-1] / self.close_history[-1 - self.lookback_bars] - 1.0
+
+        eligible_mask = pd.Series(True, index=current_close.index)
+        if self.min_volume_rank > 0.0:
+            volume_rank = current_market_data["volume"].rank(pct=True)
+            eligible_mask = volume_rank >= self.min_volume_rank
+
+        eligible_returns = signal_return[eligible_mask]
+        if eligible_returns.empty:
+            self.prev_close = current_close
+            self.held_weights = weights
+            self.bars_left_in_hold = 0
+            return weights
+
+        if self.mode == "reversal":
+            selected = eligible_returns.nsmallest(self.top_k).index
+        elif self.mode == "momentum":
+            selected = eligible_returns.nlargest(self.top_k).index
+        else:
+            raise ValueError("mode must be either 'reversal' or 'momentum'.")
+
+        if len(selected) > 0:
+            weights.loc[selected] = 1.0 / len(selected)
+
+        self.held_weights = weights.copy()
+        self.bars_left_in_hold = self.hold_bars - 1
+        self.prev_close = current_close
         return weights
-        
-        # --- END OF EXAMPLE STRATEGY LOGIC ---

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from collections import deque
 from typing import Deque, Dict, List, Optional, Tuple
@@ -19,12 +20,12 @@ STUDENT INSTRUCTIONS:
    evaluation errors.
 """
 
+@dataclass
 class _TickerState:
-    def __init__(self, maxlen: int):
-        self.close: Deque[float] = deque(maxlen=maxlen)
-        self.volume: Deque[float] = deque(maxlen=maxlen)
-        self.ret_5m: Deque[float] = deque(maxlen=maxlen)
-        self.prev_vol_chg: Optional[float] = None
+    close: Deque[float]
+    volume: Deque[float]
+    ret_5m: Deque[float]
+    prev_vol_chg: Optional[float] = None
 
 
 class Strategy:
@@ -100,7 +101,11 @@ class Strategy:
     def _get_state(self, ticker: str) -> _TickerState:
         st = self.state.get(ticker)
         if st is None:
-            st = _TickerState(maxlen=self._maxlen)
+            st = _TickerState(
+                close=deque(maxlen=self._maxlen),
+                volume=deque(maxlen=self._maxlen),
+                ret_5m=deque(maxlen=self._maxlen),
+            )
             self.state[ticker] = st
         return st
 
@@ -235,6 +240,11 @@ class Strategy:
         feats["corr_mean_ma"] = feats["close_volume_corr"]
         feats["corr_std_ma"] = 0.0
 
+        return feats
+
+    def step(self, current_market_data: pd.DataFrame) -> pd.Series:
+        """
+        Return target weights for the next bar.
         """
 
         if "close" not in current_market_data.columns:
@@ -244,11 +254,7 @@ class Strategy:
             current_market_data["volume"] = 0.0
 
         tickers = current_market_data.index
-        # Final output weights (must match tickers exactly)
         weights = pd.Series(0.0, index=tickers, dtype=float)
-        # Two sub-strategies: LGBM Top-K and cross-sectional reversal (1 name)
-        w_lgb = pd.Series(0.0, index=tickers, dtype=float)
-        w_rev = pd.Series(0.0, index=tickers, dtype=float)
 
         # --- Update bar counter / day boundary approximation ---
         self.bar_in_day += 1
@@ -281,67 +287,43 @@ class Strategy:
             st.close.append(c)
             st.volume.append(v)
 
-        # --- Reversal sub-strategy (hold 1 name for 1 bar) ---
-        # Buy the worst last-bar return name (cross-sectional reversal), equal weight within this sleeve.
-        # Uses the latest computed 5-minute return stored in st.ret_5m (prev->current).
-        rev_scores: Dict[str, float] = {}
+        if not self._model_ok or self.model is None:
+            return weights
+
+        # --- Build feature matrix for current bar ---
+        rows: List[Dict[str, float]] = []
+        row_tickers: List[str] = []
         for t in tickers:
             tt = str(t)
-            st = self.state.get(tt)
-            if st is None or len(st.ret_5m) == 0:
+            feats = self._compute_features_for_ticker(tt)
+            if len(feats) == 0:
                 continue
-            r = st.ret_5m[-1]
-            if r is None or not np.isfinite(r):
-                continue
-            rev_scores[tt] = float(r)
+            rows.append(feats)
+            row_tickers.append(tt)
 
-        if rev_scores:
-            # smallest return => strongest reversal candidate
-            rev_pick = min(rev_scores, key=rev_scores.get)
-            w_rev.loc[rev_pick] = 1.0
+        if not rows:
+            return weights
 
-        # --- LGBM sub-strategy (Top-K) ---
-        if self._model_ok and self.model is not None:
-            rows: List[Dict[str, float]] = []
-            row_tickers: List[str] = []
-            for t in tickers:
-                tt = str(t)
-                feats = self._compute_features_for_ticker(tt)
-                if len(feats) == 0:
-                    continue
-                rows.append(feats)
-                row_tickers.append(tt)
+        feat_df = pd.DataFrame(rows, index=row_tickers)
+        for c in self.feature_cols:
+            if c not in feat_df.columns:
+                feat_df[c] = 0.0
+        feat_df = feat_df[self.feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(np.float32)
 
-            if rows:
-                feat_df = pd.DataFrame(rows, index=row_tickers)
-                for c in self.feature_cols:
-                    if c not in feat_df.columns:
-                        feat_df[c] = 0.0
-                feat_df = (
-                    feat_df[self.feature_cols]
-                    .replace([np.inf, -np.inf], np.nan)
-                    .fillna(0.0)
-                    .astype(np.float32)
-                )
+        # Predict next-bar return
+        try:
+            if self.best_iteration is not None:
+                preds = self.model.predict(feat_df.values, num_iteration=self.best_iteration)
+            else:
+                preds = self.model.predict(feat_df.values)
+        except Exception:
+            return weights
 
-                try:
-                    if self.best_iteration is not None:
-                        preds = self.model.predict(feat_df.values, num_iteration=self.best_iteration)
-                    else:
-                        preds = self.model.predict(feat_df.values)
-                    pred_s = pd.Series(preds, index=feat_df.index).replace([np.inf, -np.inf], np.nan).fillna(-np.inf)
-                    selected = pred_s.nlargest(self.top_k).index.tolist()
-                    if selected:
-                        w = 1.0 / len(selected)
-                        w_lgb.loc[selected] = w
-                except Exception:
-                    # If prediction fails, keep this sleeve in cash
-                    pass
+        pred_s = pd.Series(preds, index=feat_df.index).replace([np.inf, -np.inf], np.nan).fillna(-np.inf)
+        selected = pred_s.nlargest(self.top_k).index.tolist()
 
-        # --- Combine sleeves (50% / 50%) ---
-        weights = 0.5 * w_lgb + 0.5 * w_rev
-        # Safety: avoid float overshoots
-        s = float(weights.sum())
-        if s > 1.0 + 1e-9:
-            weights = weights / s
+        if selected:
+            w = 1.0 / len(selected)
+            weights.loc[selected] = w
+
         return weights

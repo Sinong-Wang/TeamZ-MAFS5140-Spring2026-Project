@@ -36,6 +36,10 @@ The `engine.py` will strictly validate your output at every step. If you violate
 
 1. Ensure you have the provided dataset in your project directory.
 2. Open your terminal or command prompt.
-3. Run the main script:
+3. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+4. Run the main script:
    ```bash
    python main.py

@@ -235,6 +235,11 @@ class Strategy:
         feats["corr_mean_ma"] = feats["close_volume_corr"]
         feats["corr_std_ma"] = 0.0
 
+        return feats
+
+    def step(self, current_market_data: pd.DataFrame) -> pd.Series:
+        """
+        Return target weights for the next bar.
         """
 
         if "close" not in current_market_data.columns:

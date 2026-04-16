@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from collections import deque
 from typing import Deque, Dict, List, Optional, Tuple
+import os
 
 import numpy as np
 import pandas as pd
@@ -71,6 +72,43 @@ class Strategy:
 
         self._load_model()
 
+    def _candidate_model_paths(self) -> List[Path]:
+        # Allow overrides for TA machines / autograder.
+        env_path = os.environ.get("LGB_MODEL_PATH")
+        if env_path:
+            p = Path(env_path).expanduser()
+            return [p]
+
+        here = Path(__file__).resolve().parent
+        candidates = [
+            # Default: repo_root/artifacts/lgb_model_5m.pkl
+            here / "artifacts" / "lgb_model_5m.pkl",
+            # In case strategy.py is executed from another working dir
+            Path.cwd() / "artifacts" / "lgb_model_5m.pkl",
+        ]
+
+        # If the repo is nested one level (common when running from workspace root)
+        if here.parent != here:
+            candidates.append(here.parent / "artifacts" / "lgb_model_5m.pkl")
+
+        # Way2 booster bundle (optional): repo_root/artifacts/lgb_way2_booster.pkl
+        candidates += [
+            here / "artifacts" / "lgb_way2_booster.pkl",
+            Path.cwd() / "artifacts" / "lgb_way2_booster.pkl",
+        ]
+        if here.parent != here:
+            candidates.append(here.parent / "artifacts" / "lgb_way2_booster.pkl")
+
+        # De-dup while preserving order
+        seen: set[str] = set()
+        out: List[Path] = []
+        for c in candidates:
+            k = str(c)
+            if k not in seen:
+                seen.add(k)
+                out.append(c)
+        return out
+
     def _load_model(self) -> None:
         """
         Load the LightGBM model saved from `lgb_exp.ipynb`.
@@ -82,17 +120,34 @@ class Strategy:
             self._model_ok = False
             return
 
-        model_path = Path(__file__).resolve().parent / "artifacts" / "lgb_model_5m.pkl"
-        if not model_path.exists():
+        model_path = None
+        for p in self._candidate_model_paths():
+            if p.exists():
+                model_path = p
+                break
+        if model_path is None:
             self._model_ok = False
             return
 
         try:
             bundle = joblib.load(model_path)
-            self.model = bundle.get("model", None)
-            self.feature_cols = list(bundle.get("feature_cols", []))
-            bi = bundle.get("best_iteration", None)
-            self.best_iteration = int(bi) if bi is not None else None
+            # Support both:
+            # - way1 sklearn wrapper bundle: {"model": ..., "feature_cols": ..., "best_iteration": ...}
+            # - way2 booster bundle: {"booster": ..., "feature_cols": ...}
+            if isinstance(bundle, dict) and "model" in bundle:
+                self.model = bundle.get("model", None)
+                self.feature_cols = list(bundle.get("feature_cols", []))
+                bi = bundle.get("best_iteration", None)
+                self.best_iteration = int(bi) if bi is not None else None
+            elif isinstance(bundle, dict) and "booster" in bundle:
+                self.model = bundle.get("booster", None)
+                self.feature_cols = list(bundle.get("feature_cols", []))
+                self.best_iteration = None
+            else:
+                self.model = None
+                self.feature_cols = []
+                self.best_iteration = None
+
             self._model_ok = self.model is not None and len(self.feature_cols) > 0
         except Exception:
             self._model_ok = False

@@ -2,10 +2,12 @@ from data_feed import DataFeed
 from engine import BacktestEngine
 from evaluator import Evaluator
 from strategy import Strategy 
+from pathlib import Path
 
 def main():
     # 1. Define the path to the dataset
-    data_path = "D:/coding_experiment/TeamZ-MAFS5140-Spring2026-Project/validation.parquet" 
+    # Use Path to avoid backslash escape issues on Windows (e.g., "\t").
+    data_path = str(Path(__file__).resolve().parent / "test.parquet")
     
     try:
         # 2. Initialize components
